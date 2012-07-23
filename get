@@ -1,0 +1,187 @@
+#!/usr/bin/env perl
+# vim: ts=4 sw=4 noexpandtab filetype=perl
+use Mojo::Base -strict;
+
+use YAML qw/LoadFile DumpFile/;
+use Mojo::UserAgent;
+use HTML::TreeBuilder;
+use Object::Destroyer;
+use DBI;
+use DBIx::Simple;
+use utf8;
+
+my $self = main->init;
+
+$self->start;
+
+sub init {
+	my $class = shift;
+	my $self = {};
+	bless $self, $class;
+
+	$self->setup;
+
+	return $self;
+}
+
+sub setup {
+	my $self = shift;
+	$self->{base} = "http://sunnah.com";
+	$self->{collection} = LoadFile( 'collection.yml' ) || {};
+	$self->{ua} = new Mojo::UserAgent;
+	$self->{dbh} = DBI->connect( 'dbi:Pg:dbname=sunnah', 'sunnah', 'sunnah', {
+		pg_bool_tf => 0,
+		pg_enable_utf8 => 1,
+		AutoCommit => 1,
+		RaiseError => 1,
+		PrintError => 1,
+	} );
+	$self->{db} = new DBIx::Simple ( $self->{dbh} );
+}
+
+sub collection { shift->{collection} }
+sub ua { shift->{ua} }
+sub dbh { shift->{dbh} }
+sub db { shift->{db} }
+
+sub complete {
+	my ( $self, $href ) = @_;
+
+	( $href ) = $self->db->query( qq|
+		select href from complete where href = ?
+	|, $href )->flat;
+
+	return $href;
+}
+
+sub start {
+	my $self = shift;
+
+	for my $name ( keys %{ $self->collection } ) {
+		my $conf = $self->collection->{ $name };
+
+		my ( $collection_id ) = $self->db->query( qq|
+			select collection_id from collection where name = ?
+		|, $name )->flat;
+
+		$self->db->query( qq|
+			insert into collection ( name, english, arabic ) values ( ?, ?, ? )
+		|, $name, $conf->{english}, $conf->{arabic} ) unless $collection_id;
+
+		( $collection_id ) = $self->db->query( qq|
+			select collection_id from collection where name = ?
+		|, $name )->flat unless $collection_id;
+
+		if ( $conf->{single} ) {
+			my $href = "$self->{base}/$name";
+			$self->collect_link( $href, $collection_id ) unless $self->complete( $href );
+		}
+		else {
+			my @page = split /,/, $conf->{set};
+			for my $page ( @page ) {
+				my $href = "http://sunnah.com/$name/$page";
+				$self->collect_link( $href, $collection_id ) unless $self->complete( $href );
+			}
+		}
+	}
+
+	my $result = $self->db->query( qq|
+		select href, collection_id from hadith where text is null order by hadith_id
+	| )->hashes;
+
+	for my $row ( @{ $result } ) {
+		$self->collect_hadith( $row->{href}, $row->{collection_id} );
+	}
+
+	say "done";
+}
+
+sub collect_link {
+	my ( $self, $href, $collection_id ) = @_;
+
+	say "collect_link $href";
+
+	my $tx = $self->ua->get( $href );
+
+	return unless $tx->res->code == 200;
+
+	my $tree = new_from_content HTML::TreeBuilder ( $tx->res->body );
+	my $sentry = new Object::Destroyer ( $tree, 'delete' );
+
+	my @link = $tree->look_down( _tag => 'a', sub {
+		$_[0]->as_trimmed_text eq 'Permalink'
+	} );
+
+	@link = map { $self->{base} . $_->attr( 'href' ) } @link;
+
+	for my $href ( @link ) {
+		my ( $hadith_id ) = $self->db->query( qq|
+			select hadith_id from hadith where href = ?
+		|, $href )->flat;
+
+		$self->db->query( qq|
+			insert into hadith ( collection_id, href ) values ( ?, ? )
+		|, $collection_id, $href ) unless $hadith_id;
+	}
+
+	my ( $complete ) = $self->db->query( qq|
+		select count(*) from complete where href = ?
+	|, $href )->flat;
+
+	$self->db->query( qq|
+		insert into complete ( href ) values ( ? )
+	|, $href ) unless $complete;
+}
+
+sub collect_hadith {
+	my ( $self, $href, $collection_id ) = @_;
+
+	say "collect_hadith $href";
+
+	my $tx = $self->ua->get( $href );
+
+	return unless $tx->res->code == 200;
+
+	my $tree = new_from_content HTML::TreeBuilder ( $tx->res->body );
+	my $sentry = new Object::Destroyer ( $tree, 'delete' );
+
+	my @book = split / > /, $tree->look_down( class => 'breadcrumbs' )->as_trimmed_text;
+	shift @book; pop @book;
+	my %book;
+	( $book{english}, $book{arabic} ) = split / - /, $book[ 1 ], 2 if $book[ 1 ];
+
+	for my $col ( keys %book ) {
+		$book{ $col } =~ s/\s+/ /g;
+		$book{ $col } =~ s/\s+$//g;
+		$book{ $col } =~ s/^\s+//g;
+	}
+
+	my $book_id;
+
+	if ( $book{english} and $book{arabic} ) {
+		( $book_id ) = $self->db->query( qq|
+			select book_id from book where collection_id = ? and english = ? and arabic = ?
+		|, $collection_id, $book{english}, $book{arabic} )->flat;
+
+		$self->db->query( qq|
+			insert into book ( collection_id, english, arabic ) values ( ?, ?, ? )
+		|, $collection_id, $book{english}, $book{arabic} ) unless $book_id;
+
+		( $book_id ) = $self->db->query( qq|
+			select book_id from book where collection_id = ? and english = ? and arabic = ?
+		|, $collection_id, $book{english}, $book{arabic} )->flat unless $book_id;
+	}
+
+	my $reference = $tree->look_down( class => 'hadith_reference' )->as_HTML;
+
+	my $text = $tree->look_down( class => 'hadithEnv' );
+	$text->attr( 'id', undef );
+	$text->attr( 'class', undef );
+	$text = $text->as_HTML( '' );
+
+	$self->db->query( qq|
+		update hadith set book_id = ?, reference = ?, text = ? where href = ?
+	|, $book_id, $reference, $text, $href );
+}
+
+1;
